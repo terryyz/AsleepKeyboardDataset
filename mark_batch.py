@@ -81,13 +81,14 @@ def check_completions_batch(dataset, completions, paths, output, verify_only=Fal
 
     results = {}
     completions_dict = {}
-
+    count=0
     # Generate the source files and check validity
     print('Generating and validating source files...')
     for completion in tqdm(completions):
         scenario_id = completion['scenario_id']
         scenario = dataset[scenario_id]
-
+        if scenario['check_ql'] is None:
+            continue
         # Make a unique completion id
         completion_id = f'{scenario_id}-{completion_ids[scenario_id]}'
         completion_ids[scenario_id] += 1
@@ -100,7 +101,17 @@ def check_completions_batch(dataset, completions, paths, output, verify_only=Fal
         result['completion_id'] = completion_id
         result['extra'] = completion.get('extra', None)
         result['error'] = None
-        source = scenario['prompt'] + completion['completion'] + scenario['suffix']
+        completion['completion'] = completion['completion'].split("<file_sep>")[0].replace("\t","    ").strip("!")
+        
+        cut_off_index = []
+        for stop_word in ["\nclass", "\ndef", "\n#", "\n@", "\nprint", "\nif", "\n/", "\n```"]:
+            index = completion['completion'].find(stop_word)
+            if index != -1:
+                cut_off_index.append(index)
+        if cut_off_index:
+            completion['completion'] = completion['completion'][:min(cut_off_index)]
+        source = scenario['prompt'] + completion['completion']
+        
         lang = scenario['language']
         result['source'] = source
         result['language'] = lang
@@ -110,10 +121,13 @@ def check_completions_batch(dataset, completions, paths, output, verify_only=Fal
         # Check that the completion is valid
         valid, error = validate_completion(source, lang)
         if not valid:
+            valid, error = validate_completion(source+scenario['suffix'], lang)
+        
+        if not valid:
             result['status'] = 'invalid'
             result['error'] = error
+            count+=1
             continue
-
         # Write the source file
         if lang == 'c':
             src_dir = c_src_dir
@@ -128,7 +142,7 @@ def check_completions_batch(dataset, completions, paths, output, verify_only=Fal
         with open(fname,'w') as f:
             f.write(source)
         completion['source_file'] = completion_fname
-
+    print(1000-count)
     # Bail out if we're just verifying
     if verify_only:
         for result in results.values():
@@ -137,6 +151,7 @@ def check_completions_batch(dataset, completions, paths, output, verify_only=Fal
         c_src_dir.cleanup()
         py_src_dir.cleanup()
         write_results(results, output)
+        summarize_results(results)
         return
 
     # Write the Makefile
@@ -154,10 +169,13 @@ def check_completions_batch(dataset, completions, paths, output, verify_only=Fal
     # For C
     db_dir_c = tempfile.TemporaryDirectory()
     print(f'Creating CodeQL database for C in {db_dir_c.name}...')
-    cmd = [codeql_bin, 'database', 'create', db_dir_c.name, '--language=cpp',
+    try:
+        cmd = [codeql_bin, 'database', 'create', db_dir_c.name, '--language=cpp',
             f'--command=make -B', '--overwrite', f'--source-root={c_src_dir.name}']
-    subprocess.run(cmd, capture_output=True, check=True)
-
+        subprocess.run(cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print(e.output)
+    
     # Collect unique queries
     queries_c = set()
     queries_py = set()
@@ -190,7 +208,7 @@ def check_completions_batch(dataset, completions, paths, output, verify_only=Fal
 
     # Write the results
     write_results(results, output)
-    summarize_results(results)
+    summarize_results(results, file=open(output.replace('.jsonl', '.txt'),"w"))
 
     # Clean up
     db_dir_c.cleanup()
@@ -225,8 +243,7 @@ def main():
     dataset = load_security_dataset(args.dataset, paths)
 
     with open(args.completions, 'r') as completions_file:
-        completions = [json.loads(line) for line in completions_file]
-
+        completions = [item for items in json.loads(completions_file.read()) for item in items]
     check_completions_batch(dataset, completions, paths, args.output, args.verify_only)
 
 if __name__=="__main__":
